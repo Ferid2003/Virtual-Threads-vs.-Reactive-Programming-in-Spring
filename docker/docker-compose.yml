@@ -1,0 +1,77 @@
+name: bench
+
+# Shared settings for the system under test. Every app variant gets the same limits and JVM flags.
+# G1 is pinned because JVM ergonomics would pick SerialGC at 1 CPU / <1792 MB and change the GC between configs.
+x-app: &app
+  cpus: ${APP_CPUS}
+  mem_limit: ${APP_MEM}
+  depends_on:
+    postgres: { condition: service_healthy }
+    stub-service: { condition: service_started }
+  environment: &app-env
+    DB_HOST: postgres
+    STUB_URL: http://stub-service:8090
+    JAVA_TOOL_OPTIONS: -Xms${JVM_HEAP} -Xmx${JVM_HEAP} -XX:+UseG1GC
+
+x-mvc-build: &mvc-build
+  context: ..
+  dockerfile: docker/Dockerfile
+  args: { SERVICE: mvc-service, JDK: "${JDK}" }
+
+services:
+  postgres:
+    image: postgres:17
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_DB: bench
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    cpus: ${DB_CPUS}
+    mem_limit: ${DB_MEM}
+    healthcheck:
+      # -h 127.0.0.1: the temporary init-time server listens on the unix socket only,
+      # so this turns healthy only after seeding has finished.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "bench", "-d", "bench"]
+      interval: 2s
+      retries: 60
+
+  stub-service:
+    image: bench/stub-service:jdk${JDK}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args: { SERVICE: stub-service, JDK: "${JDK}" }
+    cpus: ${STUB_CPUS}
+    environment:
+      STUB_DELAY_MS: ${STUB_DELAY_MS}
+      JAVA_TOOL_OPTIONS: -XX:+UseG1GC
+    ports: ["8090:8090"]
+
+  mvc-platform:
+    <<: *app
+    image: bench/mvc-service:jdk${JDK}
+    build: *mvc-build
+    environment:
+      <<: *app-env
+      SPRING_THREADS_VIRTUAL_ENABLED: "false"
+    ports: ["8081:8080"]
+
+  mvc-virtual:
+    <<: *app
+    image: bench/mvc-service:jdk${JDK}
+    build: *mvc-build
+    environment:
+      <<: *app-env
+      SPRING_THREADS_VIRTUAL_ENABLED: "true"
+    ports: ["8082:8080"]
+
+  webflux:
+    <<: *app
+    image: bench/webflux-service:jdk${JDK}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args: { SERVICE: webflux-service, JDK: "${JDK}" }
+    ports: ["8083:8080"]
