@@ -1,17 +1,25 @@
 name: bench
 
 # Shared settings for the system under test. Every app variant gets the same limits and JVM flags.
-# G1 is pinned because JVM ergonomics would pick SerialGC at 1 CPU / <1792 MB and change the GC between configs.
 x-app: &app
   cpus: ${APP_CPUS}
+  cpuset: "${APP_CPUSET:-}"
   mem_limit: ${APP_MEM}
+  user: "${HOST_UID:-0}:${HOST_GID:-0}" # load/run.sh sets this so result files are owned by you, not root
+  stop_grace_period: 60s # time for the JVM to dump the JFR recording on shutdown
   depends_on:
     postgres: { condition: service_healthy }
     stub-service: { condition: service_started }
   environment: &app-env
     DB_HOST: postgres
     STUB_URL: http://stub-service:8090
+    # Settings under test. G1 is pinned because ergonomics would pick SerialGC at 1 CPU / <1792 MB.
     JAVA_TOOL_OPTIONS: -Xms${JVM_HEAP} -Xmx${JVM_HEAP} -XX:+UseG1GC
+    # Diagnostics only, written to the mounted results folder. Kept separate so load/run.sh can probe
+    # the JVM flags (java -XX:+PrintFlagsFinal) without starting a second recording.
+    JDK_JAVA_OPTIONS: >-
+      -XX:StartFlightRecording=filename=/results/recording.jfr,settings=default,dumponexit=true
+      -Xlog:gc*:file=/results/gc.log:uptime,level,tags
 
 x-mvc-build: &mvc-build
   context: ..
@@ -29,6 +37,7 @@ services:
     volumes:
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     cpus: ${DB_CPUS}
+    cpuset: "${DB_CPUSET:-}"
     mem_limit: ${DB_MEM}
     healthcheck:
       # -h 127.0.0.1: the temporary init-time server listens on the unix socket only,
@@ -37,13 +46,15 @@ services:
       interval: 2s
       retries: 60
 
+  # Part of the environment, not the system under test: fixed to JDK 21 for every configuration.
   stub-service:
-    image: bench/stub-service:jdk${JDK}
+    image: bench/stub-service:jdk21
     build:
       context: ..
       dockerfile: docker/Dockerfile
-      args: { SERVICE: stub-service, JDK: "${JDK}" }
+      args: { SERVICE: stub-service, JDK: "21" }
     cpus: ${STUB_CPUS}
+    cpuset: "${STUB_CPUSET:-}"
     environment:
       STUB_DELAY_MS: ${STUB_DELAY_MS}
       JAVA_TOOL_OPTIONS: -XX:+UseG1GC
@@ -56,6 +67,7 @@ services:
     environment:
       <<: *app-env
       SPRING_THREADS_VIRTUAL_ENABLED: "false"
+    volumes: ["${RUN_DIR:-../results/_adhoc/mvc-platform}:/results"]
     ports: ["8081:8080"]
 
   mvc-virtual:
@@ -65,6 +77,7 @@ services:
     environment:
       <<: *app-env
       SPRING_THREADS_VIRTUAL_ENABLED: "true"
+    volumes: ["${RUN_DIR:-../results/_adhoc/mvc-virtual}:/results"]
     ports: ["8082:8080"]
 
   webflux:
@@ -74,4 +87,5 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       args: { SERVICE: webflux-service, JDK: "${JDK}" }
+    volumes: ["${RUN_DIR:-../results/_adhoc/webflux}:/results"]
     ports: ["8083:8080"]
